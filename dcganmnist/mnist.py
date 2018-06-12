@@ -81,18 +81,14 @@ def main(_):
     with tf.Graph().as_default():
         images = prepare_input_pipeline(flags_obj)
 
-        # Set up the models
-        with tf.name_scope("Discriminator") as d_scope:
-            d_model = discriminator_model()
-        with tf.name_scope("Generator") as g_scope:
-            g_model = generator_model()
-
         # Build the models
         with tf.name_scope("LatentNoiseVector"):
             z = tfd.Normal(loc=0.0, scale=1.0).sample(sample_shape=(tf.shape(images)[0], 100))
-        with tf.name_scope(g_scope):
+        with tf.name_scope("Generator"):
+            g_model = generator_model()
             generated_images = g_model(z)
-        with tf.name_scope(d_scope):
+        with tf.name_scope("Discriminator"):
+            d_model = discriminator_model()
             with tf.name_scope("Real"):
                 d_real = d_model(images)
             with tf.name_scope("Fake") as discriminate_fake_scope:
