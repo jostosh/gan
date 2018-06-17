@@ -6,6 +6,7 @@ from official.utils.flags import core as flags_core
 import numpy as np
 from absl import flags, app as absl_app
 import os.path as opth
+import tqdm
 import os
 from sklearn.utils import shuffle
 
@@ -30,8 +31,8 @@ def generator_model():
                                     name="Conv2D" + suffix))
         model.add(layers.Activation(activation=activation, name="Activation" + suffix))
 
-    model.add(layers.Dense(7 * 7 * 64, activation=tf.nn.relu))
-    model.add(layers.BatchNormalization())
+    model.add(layers.Dense(7 * 7 * 64, activation=None, name="NoiseToSpatial"))
+    model.add(layers.Activation(tf.nn.relu, name="NoiseToSpatialActivation"))
     model.add(layers.Reshape((7, 7, 64)))
 
     conv2d_block(filters=128, strides=2, transpose=True, index=0)
@@ -58,9 +59,9 @@ class Discriminator:
             suffix = str(index)
             feature_model.add(layers.Conv2D(
                 filters=filters, strides=strides, **conv_kwargs, name="Conv{}".format(suffix)))
-            feature_model.add(layers.Dropout(name="Dropout{}".format(suffix), rate=0.3))
             feature_model.add(layers.Activation(
                 activation=activation, name="Activation{}".format(suffix)))
+            feature_model.add(layers.Dropout(name="Dropout{}".format(suffix), rate=0.3))
 
         # Three blocks of convs and dropouts
         conv2d_dropout(filters=32, strides=2, index=0)
@@ -73,7 +74,7 @@ class Discriminator:
 
     def _define_head(self):
         head_model = models.Sequential(name="DiscriminatorHead")
-        head_model.add(layers.Dense(units=10, activation=None, name="Out"))
+        head_model.add(layers.Dense(units=10, activation=None, name="Logits"))
         return head_model
 
     @property
@@ -89,20 +90,22 @@ def define_flags():
     flags_core.define_base()  # Defines batch_size and train_epochs
     flags_core.define_image()
     flags_core.set_defaults(batch_size=32, train_epochs=15)
-    flags_core.flags.DEFINE_float(name="lr", default=1e-2, help="Learning rate")
-    flags_core.flags.DEFINE_float(name="stddev", default=2e-4, help="Learning rate")
+    flags_core.flags.DEFINE_float(name="lr", default=2e-4, help="Learning rate")
+    flags_core.flags.DEFINE_float(name="stddev", default=1e-2, help="z(x) standard deviation")
     flags_core.flags.DEFINE_integer(name="num_classes", default=10, help="Number of classes")
     flags_core.flags.DEFINE_integer(name="z_dim_size", default=100,
                                     help="Dimension of noise vector")
     flags_core.flags.DEFINE_integer(name="num_labeled_examples", default=400,
                                     help="Number of labeled examples per class")
 
+def weight_normalize(layer):
+    layer.V = layer.add_weight()
 
 def main(_):
     flags_obj = flags.FLAGS
     with tf.Graph().as_default():
-        (images_lab, labels_lab), (images_unl, labels_unl), (images_test, labels_test) = \
-            prepare_input_pipeline(flags_obj)
+        (images_lab, labels_lab), (images_unl, labels_unl), (images_unl2, labels_unl2), \
+        (images_test, labels_test) = prepare_input_pipeline(flags_obj)
 
         # Setup noise vector
         with tf.name_scope("LatentNoiseVector"):
@@ -117,15 +120,16 @@ def main(_):
         # Discriminate between real and fake, and try to classify the labeled data
         with tf.name_scope("Discriminator") as discriminator_scope:
             d_model = Discriminator()
-            logits_fake, features_fake = d_model(generated_images)
-            logits_real_unl, features_real_unl = d_model(images_unl)
-            logits_real_lab, features_real_lab = d_model(images_lab)
+            logits_fake, features_fake = d_model(generated_images, training=True)
+            logits_real_unl, features_real_unl = d_model(images_unl, training=True)
+            logits_real_lab, features_real_lab = d_model(images_lab, training=True)
+            logits_train, _ = d_model(images_lab, training=False)
 
         # Set the discriminator losses
         with tf.name_scope("DiscriminatorLoss"):
             # Supervised loss, just cross-entropy. This normalizes p(y|x) where 1 <= y <= K
-            loss_supervised = tf.nn.sparse_softmax_cross_entropy_with_logits(
-                labels=labels_lab, logits=logits_real_lab)
+            loss_supervised = tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
+                labels=labels_lab, logits=logits_real_lab))
 
             # Sum of unnormalized log probabilities
             logits_sum_real = tf.reduce_logsumexp(logits_real_unl, axis=1)
@@ -142,16 +146,15 @@ def main(_):
 
         # Configure discriminator training ops
         with tf.name_scope("Train") as train_scope:
-            optimizer = tf.train.AdamOptimizer(flags_obj.lr, beta1=0.5)
+            optimizer = tf.train.GradientDescentOptimizer(flags_obj.lr * 0.1)
             optimize_d = optimizer.minimize(loss_d, var_list=d_model.trainable_variables)
-            train_accuracy_op = 0.5 * (
-                    accuracy(logits_real_lab, labels_lab) + accuracy(logits_real_unl, labels_unl))
+            train_accuracy_op = accuracy(logits_train, labels_lab)
 
         with tf.name_scope(discriminator_scope):
             with tf.control_dependencies([optimize_d]):
                 # Build a second time, so that new variables are used
                 logits_fake, features_fake = d_model(generated_images, training=True)
-                logits_real_unl, features_real_unl = d_model(images_unl, training=True)
+                logits_real_unl, features_real_unl = d_model(images_unl2, training=True)
 
         # Set the generator loss and the actual train op
         with tf.name_scope("GeneratorLoss"):
@@ -161,18 +164,22 @@ def main(_):
             loss_g = tf.reduce_mean(tf.abs(feature_mean_real - feature_mean_fake))
 
         with tf.name_scope(train_scope):
+            optimizer = tf.train.AdamOptimizer(flags_obj.lr, beta1=0.5)
             train_op = optimizer.minimize(loss_g, var_list=g_model.trainable_variables)
 
         with tf.name_scope(discriminator_scope):
             with tf.name_scope("Test"):
-                test_accuracy_op = accuracy(d_model(images_test, training=False), labels_test)
+                logits_test, _ = d_model(images_test, training=False)
+                test_accuracy_op = accuracy(logits_test, labels_test)
 
         # Setup summaries
         with tf.name_scope("Summaries"):
             summary_op = tf.summary.merge([
                 tf.summary.scalar("LossDiscriminator", loss_d),
                 tf.summary.scalar("LossGenerator", loss_g),
-                tf.summary.image("GeneratedImages", generated_images)])
+                tf.summary.image("GeneratedImages", generated_images),
+                tf.summary.scalar("ClassificationAccuracyTrain", train_accuracy_op),
+                tf.summary.scalar("ClassificationAccuracyTest", test_accuracy_op)])
         writer = tf.summary.FileWriter(_next_logdir("tensorboard/mnist_ssl"))
         writer.add_graph(tf.get_default_graph())
 
@@ -185,7 +192,8 @@ def main(_):
             for epoch in range(flags_obj.train_epochs):
                 losses_d, losses_g, accuracies = [], [], []
                 print("Epoch {}".format(epoch))
-                for _ in range(steps_per_epoch):
+                pbar = tqdm.trange(steps_per_epoch)
+                for _ in pbar:
                     if step % 100 == 0:
                         # Look Ma, no feed_dict!
                         _, loss_g_batch, loss_d_batch, summ, accuracy_batch = sess.run(
@@ -194,6 +202,8 @@ def main(_):
                     else:
                         _, loss_g_batch, loss_d_batch, accuracy_batch = sess.run(
                             [train_op, loss_g, loss_d, train_accuracy_op])
+                    pbar.set_description("Discriminator loss {0:.3f}, Generator loss {1:.3f}"
+                                         .format(loss_d_batch, loss_g_batch))
                     losses_d.append(loss_d_batch)
                     losses_g.append(loss_g_batch)
                     accuracies.append(accuracy_batch)
@@ -210,10 +220,10 @@ def main(_):
 
 def prepare_input_pipeline(flags_obj):
     (train_x, train_y), (test_x, test_y) = tf.keras.datasets.mnist.load_data(
-        "/home/jos/datasets/mnist")
+        "/home/jos/datasets/mnist/mnist.npz")
 
     def reshape_and_scale(x, img_shape=(-1, 28, 28, 1)):
-        return x.reshape(img_shape) * 2.0 - 1.0
+        return x.reshape(img_shape).astype(np.float32) / 255. * 2.0 - 1.0
 
     # Reshape data and rescale to [-1, 1]
     train_x = reshape_and_scale(train_x)
@@ -244,24 +254,30 @@ def prepare_input_pipeline(flags_obj):
 
         # Setup pipeline for labeled data
         train_ds_lab = train_pipeline(
-            (train_x_labeled, train_y_labeled),
+            (train_x_labeled, train_y_labeled.astype(np.int64)),
             flags_obj.num_labeled_examples * flags_obj.num_classes)
         images_lab, labels_lab = train_ds_lab.get_next()
 
         # Setup pipeline for unlabeled data
         train_ds_unl = train_pipeline(
-            (train_x_unlabeled, train_y_unlabeled), len(train_x_labeled))
+            (train_x_unlabeled, train_y_unlabeled.astype(np.int64)), len(train_x_labeled))
         images_unl, labels_unl = train_ds_unl.get_next()
 
+        train_x_unlabeled, train_y_unlabeled = shuffle(train_x_unlabeled, train_y_unlabeled)
+        train_ds_unl2 = train_pipeline(
+            (train_x_unlabeled, train_y_unlabeled.astype(np.int64)), len(train_x_labeled))
+        images_unl2, labels_unl2 = train_ds_unl2.get_next()
+
         # Setup pipeline for test data
-        test_ds = tf.data.Dataset.from_tensor_slices((test_x, test_y))\
+        test_ds = tf.data.Dataset.from_tensor_slices((test_x, test_y.astype(np.int64)))\
             .cache()\
             .batch(flags_obj.batch_size)\
             .repeat()\
             .make_one_shot_iterator()
         images_test, labels_test = test_ds.get_next()
 
-    return (images_lab, labels_lab), (images_unl, labels_unl), (images_test, labels_test)
+    return (images_lab, labels_lab), (images_unl, labels_unl), (images_unl2, labels_unl2), \
+           (images_test, labels_test)
 
 
 def _next_logdir(path):
