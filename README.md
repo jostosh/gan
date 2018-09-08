@@ -9,4 +9,4 @@ Reimplementations of GANs
 
 ## MNIST semi-supervised learning with manifold regularization
 - File: [`dcganmnist/mnist_ssl.py`](dcganmnist/mnist_ssl.py)
-- See blog post ...
+- See [blog post](https://medium.com/@jos.vandewolfshaar/semi-supervised-learning-with-gans-23255865d0a4).
